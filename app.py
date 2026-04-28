@@ -6,7 +6,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# CONFIGURACIÓN DE BASE DE DATOS (La tomamos de las variables de entorno de Render)
+# CONFIGURACIÓN DE BASE DE DATOS
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db_connection():
@@ -16,14 +16,25 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Leer y ejecutar el schema
-    with open('schema.sql', 'r') as f:
-        cur.execute(f.read())
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id SERIAL PRIMARY KEY,
+            nombre TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS posts (
+            id SERIAL PRIMARY KEY,
+            usuario_id INTEGER REFERENCES usuarios(id),
+            contenido TEXT NOT NULL,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
     conn.commit()
     cur.close()
     conn.close()
 
-# --- ESTILO CSS PROFESIONAL (Apple Dark Mode) ---
+# --- CSS Y HTML ---
+
 STYLE = """
 :root { --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --accent: #ff3b30; --border: #38383a; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; margin: 0; padding: 20px; max-width: 600px; margin: 0 auto; }
@@ -38,9 +49,8 @@ input, textarea { width: 100%; background: #1c1c1e; border: 1px solid var(--bord
 .flash { background: #2c2c2e; padding: 10px; border-radius: 8px; margin-bottom: 10px; font-size: 14px; }
 """
 
-# --- PLANTILLAS HTML ---
-LOGIN_HTML = f"""
-<!DOCTYPE html><html><head><title>MotosClub - Login</title><style>{STYLE}</style></head>
+LOGIN_HTML = """
+<!DOCTYPE html><html><head><title>MotosClub - Login</title><style>{{ style }}</style></head>
 <body>
     <div class="header"><h1>🏍️ MotosClub</h1></div>
     <div class="auth-box">
@@ -52,13 +62,17 @@ LOGIN_HTML = f"""
             <button type="submit" name="login" class="btn">Iniciar Sesión</button>
             <button type="submit" name="register" class="btn btn-sec" style="margin-left:5px;">Registrar</button>
         </form>
-        {% with messages = get_flashed_messages() %} {% if messages %} <div class="flash">{{ messages[0] }}</div> {% endif %} {% endwith %}
+        {% with messages = get_flashed_messages() %} 
+            {% if messages %} 
+                <div class="flash">{{ messages[0] }}</div> 
+            {% endif %} 
+        {% endwith %}
     </div>
 </body></html>
 """
 
-FORO_HTML = f"""
-<!DOCTYPE html><html><head><title>MotosClub - Foro</title><style>{STYLE}</style></head>
+FORO_HTML = """
+<!DOCTYPE html><html><head><title>MotosClub - Foro</title><style>{{ style }}</style></head>
 <body>
     <div class="header">
         <h1>🏍️ MotosClub</h1>
@@ -122,7 +136,7 @@ def login():
 
     if 'user_id' in session:
         return redirect('/foro')
-    return render_template_string(LOGIN_HTML)
+    return render_template_string(LOGIN_HTML, style=STYLE)
 
 @app.route('/foro')
 def foro():
@@ -140,7 +154,7 @@ def foro():
     cur.close()
     conn.close()
     
-    return render_template_string(FORO_HTML, posts=posts)
+    return render_template_string(FORO_HTML, posts=posts, style=STYLE)
 
 @app.route('/post', methods=['POST'])
 def post():
@@ -162,5 +176,5 @@ def logout():
     return redirect('/')
 
 if __name__ == '__main__':
-    init_db() # Crea las tablas al arrancar
+    init_db()
     app.run(host='0.0.0.0', port=5000)
