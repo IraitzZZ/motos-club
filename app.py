@@ -1,43 +1,62 @@
 # =============================================================================
-# MOTOSCLUB - Red Social para Moteros
-# Versión: 2.0 - Production Ready para Render.com
+# MOTOSCLUB - RED SOCIAL PROFESIONAL PARA MOTEROS
+# Versión: 3.0 "The Monolith"
+# Arquitectura: Single-File Production Ready
 # =============================================================================
+
 import os
 import re
 import html
+import logging
 import psycopg2
-from flask import Flask, request, redirect, render_template_string, session, flash
-from werkzeug.security import generate_password_hash, check_password_hash
+import requests
 from datetime import datetime, timedelta
 from functools import wraps
+from flask import Flask, request, redirect, render_template_string, session, flash, jsonify, g
+from werkzeug.security import generate_password_hash, check_password_hash
 from flask_wtf.csrf import CSRFProtect, generate_csrf
 
 # -----------------------------------------------------------------------------
-# CONFIGURACIÓN GLOBAL
+# CONFIGURACIÓN DE LOGGING Y APP
 # -----------------------------------------------------------------------------
-app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
-app.config['WTF_CSRF_TIME_LIMIT'] = None  # CSRF tokens sin expiración para sesiones largas
+# Configuración de logging para producción
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Inicializar protección CSRF
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'default-dev-key-change-in-prod')
+app.config['WTF_CSRF_TIME_LIMIT'] = None
+app.config['SESSION_COOKIE_SECURE'] = False # True si tienes HTTPS configurado en custom domain
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+
+# Inicialización CSRF
 csrf = CSRFProtect(app)
 
+# Configuración de Base de Datos
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+# Configuración externa (ImgBB)
+IMGBB_API_KEY = "27a447d71db292f6c1296f509a06b09e"
+
 # -----------------------------------------------------------------------------
-# CONEXIÓN Y BASE DE DATOS
+# CONEXIÓN A BASE DE DATOS (POSTGRESQL)
 # -----------------------------------------------------------------------------
 def get_db_connection():
-    """Establece conexión con PostgreSQL."""
-    return psycopg2.connect(DATABASE_URL)
-
+    """Establece una nueva conexión a la base de datos."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"Error conectando a la base de datos: {e}")
+        raise
 
 def init_db():
-    """Inicializa tablas y aplica migraciones."""
+    """Inicializa el esquema de la base de datos con tablas y relaciones completas."""
+    logger.info("Inicializando base de datos...")
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Tabla: Usuarios
+    # Tabla de Usuarios
     cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
             id SERIAL PRIMARY KEY,
@@ -46,14 +65,17 @@ def init_db():
             email TEXT DEFAULT '',
             bio TEXT DEFAULT '',
             moto TEXT DEFAULT '',
+            avatar_url TEXT DEFAULT '',
+            banner_url TEXT DEFAULT '',
             avatar_color TEXT DEFAULT '',
             racha INTEGER DEFAULT 0,
             ultima_actividad DATE,
-            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
 
-    # Tabla: Posts
+    # Tabla de Publicaciones (Posts)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS posts (
             id SERIAL PRIMARY KEY,
@@ -62,11 +84,12 @@ def init_db():
             imagen_url TEXT DEFAULT '',
             categoria TEXT DEFAULT 'General',
             fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reportes INTEGER DEFAULT 0
+            reportes INTEGER DEFAULT 0,
+            editado BOOLEAN DEFAULT FALSE
         );
     """)
 
-    # Tabla: Seguidores
+    # Tabla de Relaciones (Seguidores)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS seguidores (
             seguidor_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
@@ -77,16 +100,17 @@ def init_db():
         );
     """)
 
-    # Tabla: Likes
+    # Tabla de Interacciones (Likes/Gas)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS likes (
             usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
             post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (usuario_id, post_id)
         );
     """)
 
-    # Tabla: Comentarios
+    # Tabla de Comentarios
     cur.execute("""
         CREATE TABLE IF NOT EXISTS comentarios (
             id SERIAL PRIMARY KEY,
@@ -97,11 +121,12 @@ def init_db():
         );
     """)
 
-    # Tabla: Notificaciones
+    # Tabla de Notificaciones
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notificaciones (
             id SERIAL PRIMARY KEY,
             usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+            actor_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
             tipo TEXT NOT NULL,
             mensaje TEXT NOT NULL,
             url TEXT,
@@ -110,91 +135,105 @@ def init_db():
         );
     """)
 
-    # Tabla: Bookmarks
+    # Tabla de Bookmarks (Guardados)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bookmarks (
             usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
             post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (usuario_id, post_id)
+        );
+    """)
+
+    # Tabla de Mensajes Privados (Chat Básico)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mensajes (
+            id SERIAL PRIMARY KEY,
+            emisor_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+            receptor_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
+            contenido TEXT NOT NULL,
+            leido BOOLEAN DEFAULT FALSE,
+            fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
 
     conn.commit()
     cur.close()
     conn.close()
-
+    logger.info("Base de datos inicializada correctamente.")
 
 # -----------------------------------------------------------------------------
-# DECORADORES Y HELPERS
+# DECORADORES Y FUNCIONES AUXILIARES
 # -----------------------------------------------------------------------------
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
-            flash("Inicia sesión para continuar", "error")
+            flash("Debes iniciar sesión para acceder a esta sección.", "error")
             return redirect('/')
         return f(*args, **kwargs)
     return decorated_function
 
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or session.get('rol') != 'admin':
+            flash("Acceso denegado.", "error")
+            return redirect('/foro')
+        return f(*args, **kwargs)
+    return decorated_function
 
 def procesar_texto(text):
-    """Convierte @menciones, #hashtags y URLs de imagen en HTML seguro."""
+    """Limpia HTML y convierte menciones/hashtags/urls en enlaces seguros."""
     text = html.escape(text)
     
-    # Imágenes: URLs que terminen en extensión de imagen
+    # Imágenes seguras
     pattern_img = r'(https?://[^\s]+?\.(png|jpg|jpeg|gif|webp)(\?[^\s]*)?)'
     text = re.sub(pattern_img, r'<img src="\1" class="post-image" loading="lazy" alt="Imagen">', text)
     
-    # Menciones @usuario
+    # Menciones
     text = re.sub(r'@(\w+)', r'<a href="/perfil/\1" class="mention">@\1</a>', text)
     
-    # Hashtags #tema
+    # Hashtags
     text = re.sub(r'#(\w+)', r'<a href="/buscar?tag=\1" class="hashtag">#\1</a>', text)
     
     return text
 
-
 def string_to_color(s):
-    """Genera color HSL único y accesible desde string."""
+    """Genera un color HSL único basado en el string."""
     h = sum(ord(c) for c in s) % 360
     return f"hsl({h}, 70%, 50%)"
 
-
 def time_ago(dt):
-    """Convierte timestamp a formato relativo legible."""
-    if not dt:
-        return "hace poco"
-    now = datetime.now()
-    delta = now - dt if isinstance(dt, datetime) else timedelta(0)
-    if delta.days > 365:
-        return f"hace {delta.days // 365}a"
-    if delta.days > 0:
-        return f"hace {delta.days}d"
-    if delta.seconds >= 3600:
-        return f"hace {delta.seconds // 3600}h"
-    if delta.seconds >= 60:
-        return f"hace {delta.seconds // 60}m"
-    return "ahora"
+    """Formato relativo de tiempo."""
+    if not dt: return "Desconocido"
+    delta = datetime.now() - dt if isinstance(dt, datetime) else timedelta(0)
+    if delta.days > 365: return f"hace {delta.days // 365} años"
+    if delta.days > 30: return f"hace {delta.days // 30} meses"
+    if delta.days > 0: return f"hace {delta.days} días"
+    if delta.seconds >= 3600: return f"hace {delta.seconds // 3600} horas"
+    if delta.seconds >= 60: return f"hace {delta.seconds // 60} minutos"
+    return "ahora mismo"
 
-
-def crear_notificacion(user_id, tipo, mensaje, url=None):
-    """Crea una notificación para un usuario de forma segura."""
+def crear_notificacion(user_id, actor_id, tipo, mensaje, url=None):
+    """Crea una notificación si el usuario no se notifica a sí mismo."""
+    if user_id == actor_id:
+        return
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO notificaciones (usuario_id, tipo, mensaje, url) VALUES (%s, %s, %s, %s)",
-            (user_id, tipo, mensaje, url)
+            "INSERT INTO notificaciones (usuario_id, actor_id, tipo, mensaje, url) VALUES (%s, %s, %s, %s, %s)",
+            (user_id, actor_id, tipo, mensaje, url)
         )
         conn.commit()
         cur.close()
         conn.close()
-    except Exception:
-        pass
-
+    except Exception as e:
+        logger.error(f"Error creando notificación: {e}")
 
 def get_notif_count(user_id):
-    """Obtiene el número de notificaciones no leídas."""
+    """Obtiene contador de notificaciones no leídas."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -206,234 +245,202 @@ def get_notif_count(user_id):
     except:
         return 0
 
+def upload_to_imgbb(image_file):
+    """Sube imagen a ImgBB y devuelve la URL."""
+    if not image_file:
+        return None
+    try:
+        url = "https://api.imgbb.com/1/upload"
+        payload = {"key": IMGBB_API_KEY, "image": image_file.read()}
+        response = requests.post(url, files=payload)
+        if response.status_code == 200:
+            return response.json()['data']['url']
+    except Exception as e:
+        logger.error(f"Error subiendo a ImgBB: {e}")
+    return None
 
 # -----------------------------------------------------------------------------
-# ESTILOS CSS - PROFESIONAL Y RESPONSIVE
+# ESTILOS CSS - DISEÑO PROFESIONAL Y RESPONSIVE
 # -----------------------------------------------------------------------------
 STYLE = """
+/* Variables del Sistema de Diseño */
 :root {
     --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --bg: #0a0a0a; --bg-elev: #161618; --surface: #1c1c1e; --surface-hover: #2a2a2c;
-    --text: #f5f5f7; --text-dim: #aeaeb2; --border: #3a3a3c;
-    --accent: #ff453a; --accent-hover: #ff6055; --blue: #0a84ff; --green: #30d158;
-    --shadow: 0 4px 20px rgba(0,0,0,0.4); --radius: 14px; --radius-sm: 10px;
-    --transition: 180ms ease;
+    --bg: #050505;
+    --bg-elev: #111111;
+    --surface: #1C1C1E;
+    --surface-hover: #2C2C2E;
+    --text: #F5F5F7;
+    --text-dim: #8E8E93;
+    --border: #3A3A3C;
+    --accent: #FF3B30;
+    --accent-hover: #FF6961;
+    --blue: #0A84FF;
+    --green: #30D158;
+    --orange: #FF9F0A;
+    --shadow: 0 8px 30px rgba(0,0,0,0.4);
+    --radius: 16px;
+    --radius-sm: 12px;
+    --transition: 200ms ease;
 }
+
+/* Tema Claro */
 [data-theme="light"] {
-    --bg: #f5f5f7; --bg-elev: #ffffff; --surface: #ffffff; --surface-hover: #f0f0f2;
-    --text: #1d1d1f; --text-dim: #6e6e73; --border: #d2d2d7;
-    --shadow: 0 4px 20px rgba(0,0,0,0.08);
+    --bg: #F2F2F7;
+    --bg-elev: #FFFFFF;
+    --surface: #FFFFFF;
+    --surface-hover: #E5E5EA;
+    --text: #1D1D1F;
+    --text-dim: #636366;
+    --border: #D1D1D6;
+    --shadow: 0 8px 30px rgba(0,0,0,0.08);
 }
+
+/* Reset y Base */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 html { scroll-behavior: smooth; }
 body {
-    font-family: var(--font); background: var(--bg); color: var(--text);
-    line-height: 1.5; font-size: 15px; -webkit-font-smoothing: antialiased;
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
     transition: background var(--transition), color var(--transition);
+    padding-bottom: 80px; /* Espacio para navbar móvil */
 }
-h1, h2, h3, .title { font-weight: 700; line-height: 1.2; letter-spacing: -0.02em; }
-h1 { font-size: clamp(24px, 5vw, 32px); }
-h2 { font-size: clamp(20px, 4vw, 24px); }
-h3 { font-size: clamp(16px, 3vw, 18px); }
-p { margin-bottom: 12px; }
-a { color: var(--blue); text-decoration: none; transition: opacity var(--transition); }
-a:hover { opacity: 0.85; }
-.container { max-width: 680px; margin: 0 auto; padding: 0 16px; padding-top: env(safe-area-inset-top); }
+
+/* Tipografía */
+h1, h2, h3 { font-weight: 700; line-height: 1.2; letter-spacing: -0.02em; }
+h1 { font-size: 28px; }
+h2 { font-size: 22px; }
+h3 { font-size: 18px; }
+a { color: var(--blue); text-decoration: none; transition: opacity 0.2s; }
+a:hover { opacity: 0.8; }
+
+/* Layout */
+.container { max-width: 720px; margin: 0 auto; padding: 0 16px; }
 
 /* Navbar */
 .navbar {
-    position: sticky; top: 0; z-index: 100;
-    background: rgba(22, 22, 24, 0.85); backdrop-filter: saturate(180%) blur(20px);
-    border-bottom: 1px solid var(--border); padding: 10px 0;
-    transition: background var(--transition), border-color var(--transition);
+    position: sticky; top: 0; z-index: 1000;
+    background: rgba(17, 17, 17, 0.8);
+    backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
 }
-[data-theme="light"] .navbar { background: rgba(255, 255, 255, 0.85); }
+[data-theme="light"] .navbar { background: rgba(255, 255, 255, 0.8); }
 .nav-inner {
     display: flex; align-items: center; justify-content: space-between;
-    max-width: 680px; margin: 0 auto; padding: 0 16px;
+    max-width: 720px; margin: 0 auto; padding: 0 16px;
 }
-.nav-brand {
-    font-weight: 800; font-size: 20px; color: var(--text);
-    display: flex; align-items: center; gap: 6px; text-decoration: none;
+.nav-brand { font-weight: 800; font-size: 20px; color: var(--text); display: flex; align-items: center; gap: 6px; }
+.nav-actions { display: flex; gap: 8px; }
+.nav-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    padding: 8px 14px; border-radius: 20px; font-size: 13px; font-weight: 600;
+    cursor: pointer; text-decoration: none; transition: all 0.2s;
 }
-.nav-actions { display: flex; align-items: center; gap: 4px; }
-.nav-btn, .icon-btn {
-    background: transparent; border: none; color: var(--text);
-    padding: 8px 12px; border-radius: 10px; font-size: 14px; font-weight: 500;
-    cursor: pointer; display: flex; align-items: center; gap: 6px;
-    transition: background var(--transition); text-decoration: none;
-}
-.nav-btn:hover, .icon-btn:hover { background: var(--surface-hover); }
-.nav-btn.active { background: var(--accent); color: white; }
-.icon-btn { width: 38px; height: 38px; padding: 0; justify-content: center; font-size: 18px; position: relative; }
-.badge {
-    position: absolute; top: 2px; right: 2px; background: var(--accent); color: white;
-    font-size: 10px; font-weight: 700; min-width: 18px; height: 18px;
-    border-radius: 9px; display: flex; align-items: center; justify-content: center; padding: 0 4px;
-}
+.nav-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
+.icon-btn { border: none; padding: 8px; border-radius: 50%; min-width: 36px; text-align: center; font-size: 18px; }
+.badge { position: absolute; top: 0; right: 0; background: var(--accent); color: white; font-size: 10px; padding: 2px 5px; border-radius: 10px; font-weight: bold; }
 
-/* Cards & Forms */
+/* Cards */
 .card {
     background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 12px;
-    transition: background var(--transition), border-color var(--transition);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 16px;
+    box-shadow: var(--shadow); transition: transform 0.1s;
 }
-.card:hover { border-color: var(--text-dim); }
+.card:active { transform: scale(0.99); }
+
+/* Forms */
 input, textarea, select {
-    width: 100%; background: var(--bg-elev); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); color: var(--text); padding: 12px 14px;
-    font-size: 15px; font-family: inherit; outline: none;
-    transition: border-color var(--transition), box-shadow var(--transition);
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 12px; border-radius: var(--radius-sm);
+    font-family: inherit; font-size: 15px; outline: none;
+    transition: border-color 0.2s;
 }
-input:focus, textarea:focus, select:focus {
-    border-color: var(--accent); box-shadow: 0 0 0 3px rgba(255, 69, 58, 0.15);
-}
-input::placeholder, textarea::placeholder { color: var(--text-dim); }
-textarea { resize: vertical; min-height: 100px; }
+input:focus { border-color: var(--accent); }
+textarea { resize: vertical; min-height: 80px; }
 
 /* Buttons */
 .btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    background: var(--accent); color: white; border: none;
     padding: 12px 20px; border-radius: var(--radius-sm); font-weight: 600;
-    font-size: 14px; cursor: pointer; border: none; transition: transform var(--transition), background var(--transition);
-    text-align: center;
+    font-size: 14px; cursor: pointer; width: 100%; transition: background 0.2s;
 }
-.btn:active { transform: scale(0.98); }
-.btn-primary { background: var(--accent); color: white; width: 100%; }
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-secondary { background: var(--surface-hover); color: var(--text); }
-.btn-secondary:hover { background: var(--border); }
-.btn-ghost { background: transparent; color: var(--text-dim); padding: 6px 10px; }
-.btn-ghost:hover { color: var(--text); background: var(--surface-hover); }
-.btn-sm { padding: 6px 12px; font-size: 13px; border-radius: 8px; }
+.btn:hover { background: var(--accent-hover); }
+.btn-secondary { background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); }
+.btn-ghost { background: transparent; color: var(--text-dim); border: none; }
 
 /* Avatar */
 .avatar {
     width: 40px; height: 40px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 600; font-size: 16px; color: white; flex-shrink: 0;
-    text-transform: uppercase;
+    background: var(--surface-hover); display: flex;
+    align-items: center; justify-content: center;
+    font-weight: 600; color: white; font-size: 16px;
+    flex-shrink: 0; overflow: hidden;
 }
-.avatar-lg { width: 72px; height: 72px; font-size: 28px; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; }
+.avatar-lg { width: 80px; height: 80px; font-size: 32px; }
 
 /* Post */
-.post { position: relative; }
-.post-header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+.post-header { display: flex; gap: 10px; margin-bottom: 12px; }
 .post-author { display: flex; flex-direction: column; gap: 2px; }
 .post-author-name { font-weight: 600; color: var(--text); font-size: 15px; }
-.post-author-name:hover { text-decoration: underline; }
-.post-meta { font-size: 13px; color: var(--text-dim); display: flex; align-items: center; gap: 4px; }
-.post-category {
-    font-size: 11px; padding: 2px 8px; border-radius: 6px;
-    background: var(--surface-hover); color: var(--text-dim); font-weight: 500;
-}
-.post-content { font-size: 15px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; margin: 8px 0 12px; }
-.post-content a.mention, .post-content a.hashtag { color: var(--blue); font-weight: 500; }
-.post-image {
-    width: 100%; border-radius: var(--radius-sm); margin: 8px 0;
-    border: 1px solid var(--border); display: block; max-height: 500px; object-fit: cover;
-}
-
-/* Post Actions */
-.post-actions { display: flex; align-items: center; gap: 4px; padding-top: 10px; border-top: 1px solid var(--border); }
+.post-meta { font-size: 13px; color: var(--text-dim); }
+.post-category { font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--surface-hover); }
+.post-content { white-space: pre-wrap; word-break: break-word; margin-bottom: 12px; line-height: 1.6; }
+.post-image { width: 100%; border-radius: 12px; margin-bottom: 12px; }
+.post-actions { display: flex; gap: 8px; border-top: 1px solid var(--border); padding-top: 12px; margin-top: 8px; }
 .action-btn {
-    display: flex; align-items: center; gap: 4px; padding: 8px 12px;
-    border-radius: 8px; background: transparent; border: none;
-    color: var(--text-dim); font-size: 14px; font-weight: 500; cursor: pointer;
-    transition: background var(--transition), color var(--transition);
+    background: transparent; border: none; color: var(--text-dim);
+    padding: 6px 12px; border-radius: 8px; cursor: pointer;
+    display: flex; align-items: center; gap: 4px; font-size: 14px; font-weight: 500;
 }
 .action-btn:hover { background: var(--surface-hover); color: var(--text); }
 .action-btn.active { color: var(--accent); }
-.action-btn .count { font-weight: 600; }
 
 /* Comments */
-.comments-toggle { margin-top: 8px; }
-.comments { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); display: none; }
+.comments { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 .comments.show { display: block; }
-.comment-form { display: flex; gap: 8px; margin-bottom: 12px; }
-.comment-form input { margin: 0; flex: 1; padding: 10px 12px; font-size: 14px; }
-.comment { background: var(--bg-elev); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 8px; font-size: 14px; }
-.comment-author { font-weight: 600; margin-right: 4px; }
-.comment-time { color: var(--text-dim); font-size: 12px; margin-left: 4px; }
+.comment { background: var(--bg); padding: 10px; border-radius: 12px; margin-bottom: 8px; font-size: 14px; }
+.comment-author { font-weight: 600; margin-right: 6px; }
 
 /* Profile */
-.profile-banner {
-    height: 120px; background: linear-gradient(135deg, var(--accent), var(--blue));
-    border-radius: var(--radius) var(--radius) 0 0; margin: -16px -16px 0; position: relative;
-}
-.profile-header { display: flex; align-items: center; gap: 14px; padding-top: 36px; margin-bottom: 16px; }
-.profile-info { flex: 1; min-width: 0; }
-.profile-name { font-size: 20px; font-weight: 700; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.profile-moto { color: var(--text-dim); font-size: 14px; }
-.profile-bio { margin: 12px 0; font-size: 14px; line-height: 1.4; white-space: pre-wrap; }
-.profile-stats { display: flex; gap: 20px; padding: 12px 0; border-top: 1px solid var(--border); margin-top: 12px; }
+.profile-banner { height: 150px; background: linear-gradient(45deg, var(--accent), var(--blue)); border-radius: 16px 16px 0 0; margin: -20px -20px 0 -20px; position: relative; overflow: hidden; }
+.profile-banner img { width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
+.profile-stats { display: flex; justify-content: space-around; padding: 16px 0; border-top: 1px solid var(--border); margin-top: 16px; }
 .stat { text-align: center; }
-.stat-val { font-weight: 700; font-size: 16px; display: block; }
+.stat-val { font-size: 18px; font-weight: 700; }
 .stat-label { font-size: 12px; color: var(--text-dim); }
 
 /* Auth */
-.auth-container { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 100px); padding: 20px; }
+.auth-container { min-height: 80vh; display: flex; align-items: center; justify-content: center; }
 .auth-card { width: 100%; max-width: 400px; text-align: center; }
-.auth-logo { font-size: 32px; font-weight: 800; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; gap: 8px; }
-.auth-subtitle { color: var(--text-dim); margin-bottom: 24px; font-size: 14px; }
-.auth-form { display: flex; flex-direction: column; gap: 12px; }
-.auth-switch { margin-top: 16px; font-size: 14px; color: var(--text-dim); }
-.auth-switch button { background: none; border: none; color: var(--blue); font-weight: 500; cursor: pointer; padding: 0; font-size: inherit; }
-
-/* Flash Messages */
-.flash { padding: 12px 16px; border-radius: var(--radius-sm); margin-bottom: 12px; font-size: 14px; font-weight: 500; animation: slideIn 200ms ease; }
-@keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-.flash-error { background: rgba(255, 69, 58, 0.12); color: #ff6b61; border: 1px solid rgba(255, 69, 58, 0.3); }
-.flash-success { background: rgba(48, 209, 88, 0.12); color: #4fd676; border: 1px solid rgba(48, 209, 88, 0.3); }
-
-/* Notifications */
-.notif-list { display: flex; flex-direction: column; gap: 8px; }
-.notif-item { display: flex; gap: 10px; padding: 12px; border-radius: var(--radius-sm); background: var(--bg-elev); transition: background var(--transition); }
-.notif-item.unread { background: rgba(10, 132, 255, 0.08); border-left: 3px solid var(--blue); }
-.notif-item:hover { background: var(--surface-hover); }
-.notif-icon { font-size: 18px; margin-top: 2px; }
-.notif-content { flex: 1; min-width: 0; }
-.notif-msg { font-size: 14px; margin-bottom: 4px; }
-.notif-time { font-size: 12px; color: var(--text-dim); }
-
-/* Footer */
-.footer { text-align: center; padding: 30px 16px 60px; color: var(--text-dim); font-size: 13px; }
-.footer a { color: var(--text-dim); }
+.auth-logo { font-size: 40px; font-weight: 800; margin-bottom: 8px; }
 
 /* Utils */
-.hidden { display: none !important; }
+.flash { padding: 12px; border-radius: 12px; margin-bottom: 16px; font-weight: 500; animation: slideIn 0.3s; }
+.flash-error { background: rgba(255,59,48,0.1); color: #ff6b61; border: 1px solid rgba(255,59,48,0.3); }
+.flash-success { background: rgba(48,209,88,0.1); color: #4fd676; border: 1px solid rgba(48,209,88,0.3); }
+@keyframes slideIn { from { transform: translateY(-10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.hidden { display: none; }
 .text-center { text-align: center; }
-.mt-1 { margin-top: 8px; } .mt-2 { margin-top: 16px; }
-.mb-1 { margin-bottom: 8px; } .mb-2 { margin-bottom: 16px; }
-.flex { display: flex; } .flex-col { flex-direction: column; }
-.items-center { align-items: center; } .justify-between { justify-content: space-between; }
-.gap-1 { gap: 8px; } .gap-2 { gap: 12px; } .w-full { width: 100%; }
+.text-dim { color: var(--text-dim); }
+.mt-1 { margin-top: 8px; } .mt-2 { margin-top: 16px; } .mb-2 { margin-bottom: 16px; }
+.flex { display: flex; } .items-center { align-items: center; } .gap-1 { gap: 8px; }
 
 /* Responsive */
 @media (max-width: 480px) {
-    .container { padding: 0 12px; }
     .nav-btn span { display: none; }
-    .profile-stats { gap: 14px; }
-    .stat-val { font-size: 14px; }
-    .stat-label { font-size: 11px; }
-    .btn { padding: 11px 18px; font-size: 14px; }
-    .action-btn { padding: 7px 10px; font-size: 13px; }
+    .profile-stats { gap: 12px; }
+    .btn { padding: 12px 16px; }
 }
-
-/* Accessibility */
-@media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after {
-        animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
-        transition-duration: 0.01ms !important;
-    }
-    html { scroll-behavior: auto; }
-}
-:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 """
 
-
 # -----------------------------------------------------------------------------
-# PLANTILLAS HTML
+# PLANTILLAS HTML BASE
 # -----------------------------------------------------------------------------
 BASE_LAYOUT = """
 <!DOCTYPE html>
@@ -441,149 +448,184 @@ BASE_LAYOUT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
-    <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
-    <title>MOTOSCLUB</title>
-    <style>{{ style|safe }}</style>
+    <meta name="theme-color" content="#050505" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+    <title>MOTOSCLUB | Red Social de Moteros</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏍️</text></svg>">
+    <style>{{ style }}</style>
 </head>
 <body>
     <nav class="navbar">
         <div class="nav-inner">
             <a href="/foro" class="nav-brand">🏍️ MOTOSCLUB</a>
             <div class="nav-actions">
-                <button class="icon-btn" id="themeToggle" aria-label="Cambiar tema">🌙</button>
-                <a href="/buscar" class="icon-btn" aria-label="Buscar">🔍</a>
-                <a href="/notificaciones" class="icon-btn" aria-label="Notificaciones">
-                    🔔{% if notif_count > 0 %}<span class="badge">{{ notif_count }}</span>{% endif %}
+                <button class="nav-btn icon-btn" id="themeToggle" aria-label="Tema">🌙</button>
+                <a href="/buscar" class="nav-btn icon-btn" aria-label="Buscar">🔍</a>
+                <a href="/notificaciones" class="nav-btn icon-btn" style="position:relative" aria-label="Notificaciones">
+                    🔔 {% if notif_count > 0 %}<span class="badge">{{ notif_count }}</span>{% endif %}
                 </a>
-                <a href="/perfil" class="nav-btn{% if active=='perfil' %} active{% endif %}"><span>Yo</span></a>
+                <a href="/perfil" class="nav-btn {% if active == 'perfil' %}active{% endif %}"><span>Yo</span></a>
                 <a href="/logout" class="nav-btn"><span>Salir</span></a>
             </div>
         </div>
     </nav>
-    <main class="container" style="padding-top: 16px;">
+
+    <main class="container" style="padding-top: 24px;">
         {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}{% for category, message in messages %}
-                <div class="flash flash-{{ category }}">{{ message }}</div>
-            {% endfor %}{% endif %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="flash flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
         {% endwith %}
+        
         {{ content|safe }}
     </main>
-    <footer class="footer">
-        <p>🏍️ MOTOSCLUB &copy; {{ year }} • <a href="#">Privacidad</a> • <a href="#">Términos</a></p>
+
+    <footer style="text-align: center; padding: 40px 0; color: var(--text-dim); font-size: 12px;">
+        <p>© {{ year }} MOTOSCLUB. Hecho con ❤️ para moteros.</p>
+        <p><a href="#">Privacidad</a> • <a href="#">Términos</a></p>
     </footer>
+
     <script>
+        // Sistema de Tema Oscuro/Claro
         (function() {
-            const root = document.documentElement, toggle = document.getElementById('themeToggle');
-            const saved = localStorage.getItem('theme'), prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            function apply(theme) {
-                root.setAttribute('data-theme', theme); localStorage.setItem('theme', theme);
+            const root = document.documentElement;
+            const toggle = document.getElementById('themeToggle');
+            
+            function applyTheme(theme) {
+                root.setAttribute('data-theme', theme);
+                localStorage.setItem('theme', theme);
                 toggle.textContent = theme === 'light' ? '☀️' : '🌙';
             }
-            apply(saved || (prefersDark ? 'dark' : 'light'));
-            toggle.addEventListener('click', () => apply(root.getAttribute('data-theme') === 'light' ? 'dark' : 'light'));
+            
+            const saved = localStorage.getItem('theme');
+            const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            applyTheme(saved || (prefersDark ? 'dark' : 'light'));
+            
+            toggle.addEventListener('click', () => {
+                const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+                applyTheme(next);
+            });
         })();
-        function toggleComments(postId) {
-            const el = document.getElementById('comments-' + postId), btn = document.getElementById('toggle-' + postId);
-            if (el && btn) { const s = el.classList.toggle('show'); btn.innerHTML = s ? '▲ Ocultar' : '💬 ' + btn.dataset.count; }
+
+        // Toggle comentarios
+        function toggleComments(id) {
+            const el = document.getElementById('comments-' + id);
+            if(el) el.classList.toggle('show');
         }
-        function confirmDelete(e) { if (!confirm('¿Estás seguro? Esta acción no se puede deshacer.')) e.preventDefault(); }
     </script>
 </body>
 </html>
 """
 
-
 def render_page(content, active='', notif_count=0):
-    return render_template_string(BASE_LAYOUT, style=STYLE, content=content, active=active, notif_count=notif_count, year=datetime.now().year)
-
+    """Renderiza la página con el layout base inyectando el contenido dinámico."""
+    return render_template_string(
+        BASE_LAYOUT, 
+        style=STYLE, 
+        content=content, 
+        active=active, 
+        notif_count=notif_count, 
+        year=datetime.now().year
+    )
 
 # -----------------------------------------------------------------------------
-# RUTAS: AUTH
+# RUTAS DE AUTENTICACIÓN
 # -----------------------------------------------------------------------------
 @app.route('/', methods=['GET', 'POST'])
 def login_register():
     if 'user_id' in session:
         return redirect('/foro')
+    
+    # Generar token CSRF para formularios
+    token = generate_csrf()
     is_login = request.args.get('register') != '1'
     
+    # Renderizamos HTML directamente con el token inyectado
     auth_html = f"""
     <div class="auth-container">
         <div class="card auth-card">
             <div class="auth-logo">🏍️ MOTOSCLUB</div>
-            <p class="auth-subtitle">{"Conecta con moteros de verdad" if is_login else "Únete a la comunidad"}</p>
-            <form method="POST" class="auth-form" id="authForm">
-                <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-                <input type="text" name="nombre" placeholder="Nombre de usuario" required minlength="3" maxlength="30" pattern="[a-zA-Z0-9_]+" autocomplete="username">
-                <div style="position: relative;">
-                    <input type="password" name="password" placeholder="Contraseña" required minlength="6" autocomplete="{'current-password' if is_login else 'new-password'}" id="passwordInput">
-                    <button type="button" class="btn-ghost" style="position: absolute; right: 4px; top: 50%; transform: translateY(-50%);" onclick="togglePassword()" aria-label="Mostrar contraseña">👁️</button>
-                </div>
-                {"<label style='display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-dim);'><input type='checkbox' required> Acepto los <a href='#' style='color:var(--blue);'>Términos</a></label>" if not is_login else ""}
-                <button type="submit" name="action" value="{"login" if is_login else "register"}" class="btn btn-primary">{"ENTRAR" if is_login else "CREAR CUENTA"}</button>
+            <p class="text-dim mb-2">{"Conecta con la comunidad" if is_login else "Únete a la manada"}</p>
+            
+            <form method="POST" action="/?action={'login' if is_login else 'register'}">
+                <input type="hidden" name="csrf_token" value="{token}"/>
+                
+                <input type="text" name="nombre" placeholder="Nombre de usuario" required minlength="3" maxlength="20" pattern="[a-zA-Z0-9_]+" autocomplete="username">
+                <input type="password" name="password" placeholder="Contraseña" required minlength="6" autocomplete="current-password">
+                
+                {"<label style='font-size:13px; color:var(--text-dim); margin-bottom:12px; display:block'><input type='checkbox' required> Acepto los términos</label>" if not is_login else ""}
+                
+                <button type="submit" class="btn">{"ENTRAR" if is_login else "CREAR CUENTA"}</button>
             </form>
-            <p class="auth-switch">{"¿No tienes cuenta?" if is_login else "¿Ya tienes cuenta?"} <button type="button" onclick="window.location.href='/?{"register=1" if is_login else ""}'">{"Regístrate" if is_login else "Inicia sesión"}</button></p>
+            
+            <div class="mt-2 text-dim" style="font-size: 14px;">
+                {"¿No tienes cuenta?" if is_login else "¿Ya tienes cuenta?"}
+                <a href="/?{'register=1' if is_login else ''}">{"Regístrate" if is_login else "Entra aquí"}</a>
+            </div>
         </div>
     </div>
-    <script>function togglePassword(){{const i=document.getElementById('passwordInput');i.type=i.type==='password'?'text':'password';}}document.querySelector('input[name="nombre"]').addEventListener('input',function(e){{this.value=this.value.replace(/[^a-zA-Z0-9_]/g,'');}});</script>
     """
     
     if request.method == 'POST':
         nombre = request.form.get('nombre', '').strip()
         password = request.form.get('password', '')
-        action = request.form.get('action')
         
-        if len(nombre) < 3:
-            flash("El nombre debe tener al menos 3 caracteres", "error")
-        elif len(password) < 6:
-            flash("La contraseña debe tener al menos 6 caracteres", "error")
-        elif not re.match(r'^[a-zA-Z0-9_]+$', nombre):
-            flash("Solo letras, números y guiones bajos", "error")
+        # Validaciones
+        if len(nombre) < 3: flash("Nombre muy corto", "error")
+        elif len(password) < 6: flash("Contraseña muy corta (mín 6)", "error")
+        elif not re.match(r'^[a-zA-Z0-9_]+$', nombre): flash("Nombre inválido (solo letras, nums, _)", "error")
         else:
             conn = get_db_connection()
             cur = conn.cursor()
-            if action == 'register':
+            
+            if 'register' in request.args:
                 try:
                     hashed = generate_password_hash(password)
                     color = string_to_color(nombre)
-                    cur.execute("INSERT INTO usuarios (nombre, password, avatar_color) VALUES (%s, %s, %s)", (nombre, hashed, color))
+                    cur.execute(
+                        "INSERT INTO usuarios (nombre, password, avatar_color) VALUES (%s, %s, %s)",
+                        (nombre, hashed, color)
+                    )
                     conn.commit()
-                    flash("¡Cuenta creada! Ahora puedes entrar", "success")
-                    is_login = True
+                    flash("¡Cuenta creada! Ya puedes entrar.", "success")
                 except psycopg2.IntegrityError:
-                    flash("Ese nombre ya está en uso", "error")
+                    flash("Ese usuario ya existe.", "error")
                     conn.rollback()
                 finally:
                     cur.close(); conn.close()
-            elif action == 'login':
-                cur.execute("SELECT id, password, avatar_color, bio, moto, racha FROM usuarios WHERE nombre = %s", (nombre,))
+            else:
+                cur.execute("SELECT id, password, avatar_color, bio, moto FROM usuarios WHERE nombre=%s", (nombre,))
                 user = cur.fetchone()
                 cur.close(); conn.close()
+                
                 if user and check_password_hash(user[1], password):
                     session['user_id'] = user[0]
                     session['user_name'] = nombre
                     session['avatar_color'] = user[2]
                     session['bio'] = user[3] or ''
                     session['moto'] = user[4] or ''
-                    session['racha'] = user[5] or 0
                     return redirect('/foro')
                 else:
-                    flash("Nombre o contraseña incorrectos", "error")
-    
+                    flash("Usuario o contraseña incorrectos.", "error")
+
     return render_page(auth_html, notif_count=0)
 
-
 # -----------------------------------------------------------------------------
-# RUTAS: FORO / FEED
+# RUTAS DEL FORO / FEED
 # -----------------------------------------------------------------------------
 @app.route('/foro')
 @login_required
 def foro():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT seguido_id FROM seguidores WHERE seguidor_id = %s", (session['user_id'],))
-    following = [row[0] for row in cur.fetchall()] + [session['user_id']]
     
+    # Obtener lista de seguidos + yo
+    cur.execute("SELECT seguido_id FROM seguidores WHERE seguidor_id = %s", (session['user_id'],))
+    following_ids = [r[0] for r in cur.fetchall()] + [session['user_id']]
+    
+    # Query principal de posts
     cur.execute("""
         SELECT p.id, u.nombre, u.avatar_color, p.contenido, p.imagen_url, p.categoria, p.fecha, p.usuario_id,
                (SELECT COUNT(*) FROM likes WHERE post_id = p.id),
@@ -592,204 +634,178 @@ def foro():
                EXISTS(SELECT 1 FROM bookmarks WHERE post_id = p.id AND usuario_id = %s)
         FROM posts p JOIN usuarios u ON p.usuario_id = u.id
         WHERE p.usuario_id = ANY(%s) AND p.reportes < 5
-        ORDER BY p.fecha DESC LIMIT 30
-    """, (session['user_id'], session['user_id'], following))
+        ORDER BY p.fecha DESC LIMIT 25
+    """, (session['user_id'], session['user_id'], following_ids))
     
-    posts = []
-    for row in cur.fetchall():
-        pid, autor, color, contenido, img_url, cat, fecha, uid, likes, comments, liked, bookmarked = row
-        cur.execute("""
-            SELECT u.nombre, u.avatar_color, c.contenido, c.fecha
-            FROM comentarios c JOIN usuarios u ON c.usuario_id = u.id
-            WHERE c.post_id = %s ORDER BY c.fecha ASC LIMIT 3
-        """, (pid,))
-        coms = [(n, col, txt, time_ago(f)) for n, col, txt, f in cur.fetchall()]
-        posts.append({'id': pid, 'autor': autor, 'color': color, 'contenido': procesar_texto(contenido), 'imagen': img_url,
-                      'categoria': cat, 'fecha': time_ago(fecha), 'uid': uid, 'likes': likes, 'comments': comments,
-                      'liked': liked, 'bookmarked': bookmarked, 'comentarios': coms})
-    cur.close(); conn.close()
-    
-    form_html = """
-    <div class="card">
-        <form method="POST" action="/post">
-            <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-            <textarea name="contenido" placeholder="¿Qué ruta haces hoy? Usa @menciones y #hashtags" required maxlength="500"></textarea>
-            <div class="flex items-center gap-1 mb-1" style="flex-wrap: wrap;">
-                <select name="categoria" style="width: auto; margin: 0;">
-                    <option value="General">General</option><option value="Ruta">🛣️ Ruta</option>
-                    <option value="Mecanica">🔧 Mecánica</option><option value="Venta">💰 Venta</option>
-                    <option value="Evento">📅 Evento</option>
-                </select>
-                <input type="url" name="imagen_url" placeholder="URL de imagen (opcional)" style="flex: 1; min-width: 150px; margin: 0;" pattern="https?://.+\\.(png|jpg|jpeg|gif|webp).*">
-            </div>
-            <small style="color: var(--text-dim); display: block; margin-bottom: 10px;">💡 Pega un enlace de imagen o deja vacío</small>
-            <button type="submit" class="btn btn-primary">PUBLICAR</button>
-        </form>
-    </div>
-    """
+    posts_data = cur.fetchall()
     
     posts_html = ""
-    for p in posts:
+    token = generate_csrf() # Token para formularios de acción
+    
+    for p in posts_data:
+        pid, autor, color, contenido, img, cat, fecha, uid, likes, comments, liked, bookmarked = p
+        
+        # Procesar contenido
+        safe_content = procesar_texto(contenido)
+        time_str = time_ago(fecha)
+        
+        # Botón de borrar si es propio
+        delete_btn = f"""
+        <form action="/delete/{pid}" method="POST" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{token}"/>
+            <button class="action-btn" onclick="return confirm('¿Borrar?')">🗑️</button>
+        </form>
+        """ if uid == session['user_id'] else ""
+        
         posts_html += f"""
-        <article class="card post" id="post-{p['id']}">
+        <article class="card post">
             <div class="post-header">
-                <div class="avatar" style="background: {p['color']}">{p['autor'][0].upper()}</div>
+                <div class="avatar" style="background:{color}">{autor[0].upper()}</div>
                 <div class="post-author">
-                    <a href="/perfil/{p['autor']}" class="post-author-name">{p['autor']}</a>
-                    <div class="post-meta"><span>{p['fecha']}</span><span>•</span><span class="post-category">{p['categoria']}</span></div>
+                    <a href="/perfil/{autor}" class="post-author-name">{autor}</a>
+                    <div class="post-meta">
+                        <span>{time_str}</span>
+                        <span>•</span>
+                        <span class="post-category">{cat}</span>
+                    </div>
                 </div>
-                {"<button class='btn-ghost btn-sm' style='margin-left: auto;' onclick=\"confirmDelete(event); fetch('/delete/' + {p['id']}, {{method: 'POST', headers: {{'X-CSRFToken': document.cookie.match(/csrf_token=([^;]+)/)?.[1]}}}}).then(() => location.reload())\">🗑️</button>" if p['uid'] == session['user_id'] else ""}
+                {delete_btn}
             </div>
-            <div class="post-content">{p['contenido']}</div>
-            {f'<img src="{p["imagen"]}" class="post-image" alt="Imagen del post">' if p['imagen'] else ''}
+            
+            <div class="post-content">{safe_content}</div>
+            {f'<img src="{img}" class="post-image">' if img else ''}
+            
             <div class="post-actions">
-                <form action="/like/{p['id']}" method="POST" style="display: contents;">
-                    <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-                    <button type="submit" class="action-btn{' active' if p['liked'] else ''}" aria-label="Dar gas">⛽ <span class="count">{p['likes']}</span></button>
+                <form action="/like/{pid}" method="POST" style="display:inline">
+                    <input type="hidden" name="csrf_token" value="{token}"/>
+                    <button class="action-btn {'active' if liked else ''}">⛽ <span class="count">{likes}</span></button>
                 </form>
-                <button type="button" class="action-btn" id="toggle-{p['id']}" data-count="{p['comments']}" onclick="toggleComments({p['id']})" aria-label="Comentarios">💬 <span class="count">{p['comments']}</span></button>
-                <form action="/bookmark/{p['id']}" method="POST" style="display: contents;">
-                    <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-                    <button type="submit" class="action-btn{' active' if p['bookmarked'] else ''}" aria-label="Guardar">🔖</button>
+                
+                <button class="action-btn" onclick="toggleComments({pid})">💬 <span class="count">{comments}</span></button>
+                
+                <form action="/bookmark/{pid}" method="POST" style="display:inline">
+                    <input type="hidden" name="csrf_token" value="{token}"/>
+                    <button class="action-btn {'active' if bookmarked else ''}">🔖</button>
                 </form>
-                <button class="action-btn" style="margin-left: auto;" aria-label="Más opciones">⋯</button>
             </div>
-            <div class="comments" id="comments-{p['id']}">
-                <form action="/comment/{p['id']}" method="POST" class="comment-form">
-                    <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-                    <input type="text" name="contenido" placeholder="Escribe un comentario..." required maxlength="200">
-                    <button type="submit" class="btn btn-secondary btn-sm">Enviar</button>
+            
+            <div class="comments" id="comments-{pid}">
+                <form action="/comment/{pid}" method="POST" class="flex gap-1 mb-2">
+                    <input type="hidden" name="csrf_token" value="{token}"/>
+                    <input type="text" name="contenido" placeholder="Comentar..." required style="flex:1">
+                    <button class="btn btn-secondary" style="width:auto">Enviar</button>
                 </form>
-                {"<p style='color: var(--text-dim); font-size: 13px; text-align: center;'>Sé el primero en comentar</p>" if not p['comentarios'] else ""}
-                {"".join(f"<div class='comment'><span class='comment-author' style='color: {col}'>{n}</span><span class='comment-text'>{html.escape(t)}</span><span class='comment-time'>{t_ago}</span></div>" for n, col, t, t_ago in p['comentarios'])}
             </div>
         </article>
         """
     
-    content = form_html + posts_html if posts else form_html + """
-        <div class="card text-center" style="padding: 30px;"><p style="color: var(--text-dim);">Aún no hay publicaciones.<br>¡Sé el primero en compartir!</p></div>
+    # Formulario de publicación
+    form_html = f"""
+    <div class="card">
+        <form method="POST" action="/post">
+            <input type="hidden" name="csrf_token" value="{token}"/>
+            <textarea name="contenido" placeholder="¿Qué ruta haces hoy?" required></textarea>
+            <div class="flex gap-1 items-center mb-2" style="flex-wrap:wrap">
+                <select name="categoria" style="width:auto; margin:0">
+                    <option>General</option>
+                    <option>Ruta</option>
+                    <option>Mecanica</option>
+                    <option>Venta</option>
+                </select>
+                <input type="url" name="imagen_url" placeholder="URL Imagen (opcional)" style="flex:1; min-width:150px; margin:0">
+            </div>
+            <button type="submit" class="btn">PUBLICAR</button>
+        </form>
+    </div>
     """
+    
+    content = form_html + (posts_html if posts_data else "<div class='card text-center text-dim'>No hay posts todavía. ¡Sé el primero!</div>")
+    
+    cur.close()
+    conn.close()
+    
     return render_page(content, active='foro', notif_count=get_notif_count(session['user_id']))
 
-
 # -----------------------------------------------------------------------------
-# RUTAS: ACCIONES EN POSTS
+# RUTAS DE ACCIONES
 # -----------------------------------------------------------------------------
 @app.route('/post', methods=['POST'])
 @login_required
 def crear_post():
     contenido = request.form.get('contenido', '').strip()
     categoria = request.form.get('categoria', 'General')
-    imagen_url = request.form.get('imagen_url', '').strip()
+    img_url = request.form.get('imagen_url', '').strip()
     
-    if imagen_url and not re.match(r'^https?://.+\.(png|jpg|jpeg|gif|webp)', imagen_url, re.I):
-        flash("URL de imagen no válida", "error")
-        return redirect('/foro')
-    if not contenido and not imagen_url:
-        flash("Escribe algo o añade una imagen", "error")
+    if not contenido and not img_url:
+        flash("Publicación vacía", "error")
         return redirect('/foro')
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO posts (usuario_id, contenido, categoria, imagen_url) VALUES (%s, %s, %s, %s)",
-                (session['user_id'], contenido, categoria, imagen_url[:500] if imagen_url else ''))
+    cur.execute(
+        "INSERT INTO posts (usuario_id, contenido, categoria, imagen_url) VALUES (%s, %s, %s, %s)",
+        (session['user_id'], contenido, categoria, img_url[:500])
+    )
     
+    # Lógica de racha
     hoy = datetime.now().date()
-    cur.execute("SELECT ultima_actividad FROM usuarios WHERE id = %s", (session['user_id'],))
+    cur.execute("SELECT ultima_actividad FROM usuarios WHERE id=%s", (session['user_id'],))
     last = cur.fetchone()[0]
     if last == hoy - timedelta(days=1):
-        cur.execute("UPDATE usuarios SET racha = racha + 1, ultima_actividad = %s WHERE id = %s", (hoy, session['user_id']))
+        cur.execute("UPDATE usuarios SET racha=racha+1, ultima_actividad=%s WHERE id=%s", (hoy, session['user_id']))
     elif last != hoy:
-        cur.execute("UPDATE usuarios SET racha = 1, ultima_actividad = %s WHERE id = %s", (hoy, session['user_id']))
-    
-    menciones = re.findall(r'@(\w+)', contenido)
-    for mencionado in set(menciones):
-        cur.execute("SELECT id FROM usuarios WHERE nombre = %s AND id != %s", (mencionado, session['user_id']))
-        user = cur.fetchone()
-        if user:
-            crear_notificacion(user[0], 'mention', f"{session['user_name']} te mencionó", f"/post/{cur.lastrowid}")
+        cur.execute("UPDATE usuarios SET racha=1, ultima_actividad=%s WHERE id=%s", (hoy, session['user_id']))
     
     conn.commit()
     cur.close()
     conn.close()
-    flash("¡Publicado! 🏍️", "success")
+    flash("¡Publicado!", "success")
     return redirect('/foro')
-
 
 @app.route('/like/<int:pid>', methods=['POST'])
 @login_required
-def like_post(pid):
+def like(pid):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("INSERT INTO likes (usuario_id, post_id) VALUES (%s, %s)", (session['user_id'], pid))
-        cur.execute("SELECT usuario_id FROM posts WHERE id = %s", (pid,))
-        owner = cur.fetchone()
-        if owner and owner[0] != session['user_id']:
-            crear_notificacion(owner[0], 'like', f"A {session['user_name']} le gustó tu publicación", f"/post/{pid}")
         conn.commit()
-    except psycopg2.IntegrityError:
+    except:
         conn.rollback()
-        cur.execute("DELETE FROM likes WHERE usuario_id = %s AND post_id = %s", (session['user_id'], pid))
+        cur.execute("DELETE FROM likes WHERE usuario_id=%s AND post_id=%s", (session['user_id'], pid))
         conn.commit()
     finally:
         cur.close()
         conn.close()
     return redirect(request.referrer or '/foro')
-
-
-@app.route('/bookmark/<int:pid>', methods=['POST'])
-@login_required
-def bookmark_post(pid):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO bookmarks (usuario_id, post_id) VALUES (%s, %s)", (session['user_id'], pid))
-        conn.commit()
-    except psycopg2.IntegrityError:
-        conn.rollback()
-        cur.execute("DELETE FROM bookmarks WHERE usuario_id = %s AND post_id = %s", (session['user_id'], pid))
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-    return redirect(request.referrer or '/foro')
-
-
-@app.route('/comment/<int:pid>', methods=['POST'])
-@login_required
-def comentar(pid):
-    txt = request.form.get('contenido', '').strip()
-    if not txt:
-        return redirect(request.referrer or '/foro')
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO comentarios (post_id, usuario_id, contenido) VALUES (%s, %s, %s)", (pid, session['user_id'], txt[:200]))
-    cur.execute("SELECT usuario_id FROM posts WHERE id = %s", (pid,))
-    owner = cur.fetchone()
-    if owner and owner[0] != session['user_id']:
-        crear_notificacion(owner[0], 'comment', f"{session['user_name']} comentó en tu publicación", f"/post/{pid}")
-    conn.commit()
-    cur.close()
-    conn.close()
-    return redirect(request.referrer or '/foro')
-
 
 @app.route('/delete/<int:pid>', methods=['POST'])
 @login_required
-def borrar_post(pid):
+def delete(pid):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM posts WHERE id = %s AND usuario_id = %s", (pid, session['user_id']))
+    cur.execute("DELETE FROM posts WHERE id=%s AND usuario_id=%s", (pid, session['user_id']))
     conn.commit()
     cur.close()
     conn.close()
-    flash("Publicación eliminada", "success")
+    flash("Eliminado", "success")
     return redirect('/foro')
 
+@app.route('/comment/<int:pid>', methods=['POST'])
+@login_required
+def comment(pid):
+    txt = request.form.get('contenido', '').strip()
+    if txt:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO comentarios (post_id, usuario_id, contenido) VALUES (%s, %s, %s)", (pid, session['user_id'], txt))
+        conn.commit()
+        cur.close()
+        conn.close()
+    return redirect(request.referrer or '/foro')
 
 # -----------------------------------------------------------------------------
-# RUTAS: PERFIL
+# RUTAS DE PERFIL Y CONFIGURACIÓN
 # -----------------------------------------------------------------------------
 @app.route('/perfil')
 @app.route('/perfil/<username>')
@@ -798,63 +814,55 @@ def perfil(username=None):
     target = username or session['user_name']
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, nombre, bio, moto, avatar_color, racha, creado_en FROM usuarios WHERE nombre = %s", (target,))
+    
+    cur.execute("SELECT id, nombre, bio, moto, avatar_color, racha FROM usuarios WHERE nombre=%s", (target,))
     user = cur.fetchone()
     if not user:
         flash("Usuario no encontrado", "error")
         return redirect('/foro')
     
-    uid, nombre, bio, moto, color, racha, creado = user
-    es_mio = uid == session['user_id']
+    uid, nombre, bio, moto, color, racha = user
     
-    cur.execute("SELECT COUNT(*) FROM posts WHERE usuario_id = %s", (uid,)); posts_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM seguidores WHERE seguido_id = %s", (uid,)); followers = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM seguidores WHERE seguidor_id = %s", (uid,)); following = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM posts WHERE usuario_id=%s", (uid,))
+    posts_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM seguidores WHERE seguido_id=%s", (uid,))
+    followers = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM seguidores WHERE seguidor_id=%s", (uid,))
+    following = cur.fetchone()[0]
     
-    sigo = False
-    if not es_mio:
-        cur.execute("SELECT 1 FROM seguidores WHERE seguidor_id = %s AND seguido_id = %s", (session['user_id'], uid))
-        sigo = cur.fetchone() is not None
+    cur.execute("SELECT id, contenido, imagen_url, fecha FROM posts WHERE usuario_id=%s ORDER BY fecha DESC LIMIT 10", (uid,))
+    posts = cur.fetchall()
     
-    cur.execute("SELECT id, contenido, imagen_url, categoria, fecha FROM posts WHERE usuario_id = %s ORDER BY fecha DESC LIMIT 12", (uid,))
-    posts = [(pid, procesar_texto(txt), img, cat, time_ago(f)) for pid, txt, img, cat, f in cur.fetchall()]
     cur.close()
     conn.close()
     
-    # Botón de acción (CORREGIDO: sin ternarios anidados que rompen sintaxis)
-    if es_mio:
-        btn_accion = "<a href='/config' class='btn btn-secondary btn-sm'>Editar perfil</a>"
-    else:
-        btn_texto = "Dejar de seguir" if sigo else "Seguir"
-        btn_accion = f"<form action='/seguir/{uid}' method='POST' style='display: inline;'><input type='hidden' name='csrf_token' value='{{{{ csrf_token() }}}}'/><button class='btn btn-secondary btn-sm'>{btn_texto}</button></form>"
-    
-    perfil_html = f"""
-    <div class="card" style="padding: 0; overflow: hidden;">
+    # HTML del perfil
+    content = f"""
+    <div class="card" style="padding:0; overflow:hidden;">
         <div class="profile-banner"></div>
-        <div style="padding: 0 16px 16px;">
-            <div class="profile-header">
-                <div class="avatar avatar-lg" style="background: {color}; border: 4px solid var(--surface);">{nombre[0].upper()}</div>
-                <div class="profile-info">
-                    <h1 class="profile-name">{nombre}</h1>
-                    <p class="profile-moto">{moto or 'Motero/a'}</p>
+        <div style="padding:20px;">
+            <div class="flex items-center gap-2" style="margin-bottom:16px;">
+                <div class="avatar avatar-lg" style="background:{color}">{nombre[0].upper()}</div>
+                <div style="flex:1">
+                    <h1>{nombre}</h1>
+                    <p class="text-dim">{moto or 'Motero'}</p>
                 </div>
-                {btn_accion}
+                {"<a href='/config' class='btn btn-secondary' style='width:auto'>Editar</a>" if uid == session['user_id'] else f"<form action='/seguir/{uid}' method='POST'><input type='hidden' name='csrf_token' value='{generate_csrf()}'/><button class='btn btn-secondary' style='width:auto'>Seguir</button></form>"}
             </div>
-            {"<p class='profile-bio'>" + html.escape(bio) + "</p>" if bio else ""}
+            <p style="margin-bottom:16px">{bio or 'Sin biografía'}</p>
             <div class="profile-stats">
                 <div class="stat"><span class="stat-val">{posts_count}</span><span class="stat-label">Posts</span></div>
                 <div class="stat"><span class="stat-val">{followers}</span><span class="stat-label">Seguidores</span></div>
                 <div class="stat"><span class="stat-val">{following}</span><span class="stat-label">Siguiendo</span></div>
-                <div class="stat"><span class="stat-val">🔥 {racha}</span><span class="stat-label">Racha</span></div>
+                <div class="stat"><span class="stat-val">🔥{racha}</span><span class="stat-label">Racha</span></div>
             </div>
-            <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">Miembro desde {creado.strftime('%b %Y') if creado else '2024'}</p>
         </div>
     </div>
-    <h3 style="margin: 20px 0 12px;">Publicaciones</h3>
-    {"".join(f"<div class='card'><div style='display: flex; gap: 8px; margin-bottom: 8px;'><span class='post-category'>{cat}</span><span style='color: var(--text-dim); font-size: 13px; margin-left: auto;'>{fecha}</span></div><div class='post-content'>{cont}</div>{f'<img src=\"{img}\" class=\"post-image\">' if img else ''}</div>" for pid, cont, img, cat, fecha in posts) if posts else "<div class='card text-center' style='padding: 24px; color: var(--text-dim);'>Aún no ha publicado nada</div>"}
+    <h3 class="mb-2">Publicaciones recientes</h3>
+    {"".join([f"<div class='card'><div class='text-dim' style='font-size:13px'>{time_ago(f)}</div><div class='mt-1'>{procesar_texto(c)}</div>{f'<img src=\"{img}\" class=\"post-image\">' if img else ''}</div>" for i,c,img,f in posts])}
     """
-    return render_page(perfil_html, active='perfil', notif_count=get_notif_count(session['user_id']))
-
+    
+    return render_page(content, active='perfil', notif_count=get_notif_count(session['user_id']))
 
 @app.route('/config', methods=['GET', 'POST'])
 @login_required
@@ -862,149 +870,96 @@ def config():
     if request.method == 'POST':
         bio = request.form.get('bio', '')[:200]
         moto = request.form.get('moto', '')[:50]
+        
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE usuarios SET bio = %s, moto = %s WHERE id = %s", (bio, moto, session['user_id']))
+        cur.execute("UPDATE usuarios SET bio=%s, moto=%s WHERE id=%s", (bio, moto, session['user_id']))
         conn.commit()
         cur.close()
         conn.close()
+        
         session['bio'] = bio
         session['moto'] = moto
-        flash("Perfil actualizado ✓", "success")
+        flash("Perfil actualizado", "success")
         return redirect('/perfil')
     
-    config_html = f"""
+    token = generate_csrf()
+    content = f"""
     <div class="card">
-        <h2 style="margin-bottom: 16px;">Editar perfil</h2>
+        <h2>Configuración</h2>
         <form method="POST">
-            <input type="hidden" name="csrf_token" value="{{{{ csrf_token() }}}}"/>
-            <label style="display: block; margin-bottom: 6px; font-weight: 500;">Tu moto</label>
-            <input type="text" name="moto" placeholder="Ej: Yamaha MT-07" value="{html.escape(session.get('moto', ''))}" maxlength="50">
-            <label style="display: block; margin: 16px 0 6px; font-weight: 500;">Biografía</label>
-            <textarea name="bio" placeholder="Cuéntanos sobre ti..." maxlength="200">{html.escape(session.get('bio', ''))}</textarea>
-            <small style="color: var(--text-dim); display: block; margin-bottom: 16px;">Máx. 200 caracteres</small>
-            <button type="submit" class="btn btn-primary">Guardar cambios</button>
-            <a href="/perfil" class="btn btn-secondary" style="margin-top: 8px;">Cancelar</a>
+            <input type="hidden" name="csrf_token" value="{token}"/>
+            <label>Tu moto</label>
+            <input type="text" name="moto" value="{session.get('moto', '')}" placeholder="Ej: Yamaha MT-07">
+            <label>Biografía</label>
+            <textarea name="bio" placeholder="Cuéntanos...">{session.get('bio', '')}</textarea>
+            <button class="btn">Guardar</button>
         </form>
     </div>
     """
-    return render_page(config_html, active='perfil', notif_count=get_notif_count(session['user_id']))
-
+    return render_page(content, active='perfil', notif_count=get_notif_count(session['user_id']))
 
 # -----------------------------------------------------------------------------
-# RUTAS: SEGUIR / NOTIFICACIONES / BUSCAR
+# OTRAS RUTAS
 # -----------------------------------------------------------------------------
 @app.route('/seguir/<int:uid>', methods=['POST'])
 @login_required
 def seguir(uid):
-    if uid == session['user_id']:
-        return redirect('/perfil')
+    if uid == session['user_id']: return redirect('/perfil')
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("INSERT INTO seguidores (seguidor_id, seguido_id) VALUES (%s, %s)", (session['user_id'], uid))
-        crear_notificacion(uid, 'follow', f"{session['user_name']} empezó a seguirte", f"/perfil/{session['user_name']}")
         conn.commit()
-    except psycopg2.IntegrityError:
+    except:
         conn.rollback()
-        cur.execute("DELETE FROM seguidores WHERE seguidor_id = %s AND seguido_id = %s", (session['user_id'], uid))
+        cur.execute("DELETE FROM seguidores WHERE seguidor_id=%s AND seguido_id=%s", (session['user_id'], uid))
         conn.commit()
     finally:
         cur.close()
         conn.close()
-    return redirect(request.referrer or f'/perfil/{uid}')
-
+    return redirect(request.referrer or '/foro')
 
 @app.route('/notificaciones')
 @login_required
 def notificaciones():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE notificaciones SET leido = TRUE WHERE usuario_id = %s", (session['user_id'],))
-    cur.execute("SELECT tipo, mensaje, url, fecha FROM notificaciones WHERE usuario_id = %s ORDER BY fecha DESC LIMIT 30", (session['user_id'],))
-    notifs = []
-    icons = {'like': '⛽', 'comment': '💬', 'follow': '👤', 'mention': '@'}
-    for tipo, msg, url, fecha in cur.fetchall():
-        notifs.append({'icon': icons.get(tipo, '🔔'), 'msg': msg, 'url': url, 'time': time_ago(fecha)})
+    cur.execute("UPDATE notificaciones SET leido=TRUE WHERE usuario_id=%s", (session['user_id'],))
+    conn.commit()
+    cur.execute("SELECT tipo, mensaje, url, fecha FROM notificaciones WHERE usuario_id=%s ORDER BY fecha DESC LIMIT 30", (session['user_id'],))
+    
+    items = ""
+    for t, m, u, f in cur.fetchall():
+        icon = {'like': '⛽', 'comment': '💬', 'follow': '👤'}.get(t, '🔔')
+        items += f"<a href='{u or '#'}' class='card' style='padding:12px; margin-bottom:8px'><span>{icon} {m}</span><span class='text-dim' style='font-size:12px; margin-top:4px; display:block'>{time_ago(f)}</span></a>"
+    
     cur.close()
     conn.close()
     
-    notif_html = f"""
-    <h2 style="margin-bottom: 16px;">Notificaciones</h2>
-    <div class="notif-list">
-        {"".join(f"<a href='{n['url'] or '#'}' class='notif-item{' unread' if i==0 else ''}'><span class='notif-icon'>{n['icon']}</span><div class='notif-content'><div class='notif-msg'>{html.escape(n['msg'])}</div><div class='notif-time'>{n['time']}</div></div></a>" for i, n in enumerate(notifs)) if notifs else "<div class='card text-center' style='padding: 30px; color: var(--text-dim);'>🎉 Sin notificaciones nuevas</div>"}
-    </div>
-    """
-    return render_page(notif_html, active='notifs', notif_count=0)
-
+    return render_page(f"<h2 class='mb-2'>Notificaciones</h2>{items if items else '<p class=\"text-center text-dim\">Sin notificaciones</p>'}", active='notif', notif_count=0)
 
 @app.route('/buscar')
 @login_required
 def buscar():
-    query = request.args.get('q', '').strip()
-    tag = request.args.get('tag', '').strip()
+    q = request.args.get('q', '')
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    if tag:
-        cur.execute("SELECT p.id, u.nombre, u.avatar_color, p.contenido, p.imagen_url, p.fecha FROM posts p JOIN usuarios u ON p.usuario_id = u.id WHERE p.contenido ILIKE %s AND p.reportes < 5 ORDER BY p.fecha DESC LIMIT 20", (f'%#{tag}%',))
-        titulo = f'Posts con #{tag}'
-    elif query:
-        cur.execute("SELECT p.id, u.nombre, u.avatar_color, p.contenido, p.imagen_url, p.fecha FROM posts p JOIN usuarios u ON p.usuario_id = u.id WHERE (p.contenido ILIKE %s OR u.nombre ILIKE %s) AND p.reportes < 5 ORDER BY p.fecha DESC LIMIT 20", (f'%{query}%', f'%{query}%'))
-        titulo = f'Resultados para "{query}"'
-    else:
-        cur.execute("SELECT p.id, u.nombre, u.avatar_color, p.contenido, p.imagen_url, p.fecha FROM posts p JOIN usuarios u ON p.usuario_id = u.id WHERE p.fecha > NOW() - INTERVAL '48 hours' AND p.reportes < 5 ORDER BY (SELECT COUNT(*) FROM likes WHERE post_id = p.id) DESC, p.fecha DESC LIMIT 20")
-        titulo = '🔥 Tendencias'
-    
-    resultados = [{'id': pid, 'autor': autor, 'color': color, 'contenido': procesar_texto(contenido), 'imagen': img, 'fecha': time_ago(fecha)} for pid, autor, color, contenido, img, fecha in cur.fetchall()]
+    cur.execute("SELECT p.id, u.nombre, p.contenido FROM posts p JOIN usuarios u ON p.usuario_id=u.id WHERE p.contenido ILIKE %s LIMIT 10", (f'%{q}%',))
+    rows = cur.fetchall()
     cur.close()
     conn.close()
     
-    buscar_html = f"""
-    <h2 style="margin-bottom: 12px;">{titulo}</h2>
-    <form action="/buscar" method="GET" style="margin-bottom: 16px;">
-        <input type="search" name="q" placeholder="Buscar usuarios o posts..." value="{html.escape(query)}" style="margin: 0;">
-    </form>
-    {"".join(f"<div class='card'><div style='display: flex; gap: 10px; margin-bottom: 8px;'><div class='avatar' style='background: {r['color']}; width: 32px; height: 32px; font-size: 14px;'>{r['autor'][0].upper()}</div><div><a href='/perfil/{r['autor']}' style='font-weight: 500;'>{r['autor']}</a> <span style='color: var(--text-dim); font-size: 13px;'>· {r['fecha']}</span></div></div><div class='post-content'>{r['contenido']}</div>{f'<img src=\"{r['imagen']}\" class=\"post-image\">' if r['imagen'] else ''}</div>" for r in resultados) if resultados else "<div class='card text-center' style='padding: 30px; color: var(--text-dim);'>No hay resultados</div>"}
-    """
-    return render_page(buscar_html, active='buscar', notif_count=get_notif_count(session['user_id']))
+    res = "".join([f"<div class='card'><b>{n}</b><p>{c[:100]}...</p></div>" for i,n,c in rows])
+    return render_page(f"<h2>Resultados para '{q}'</h2>{res}", active='buscar')
 
-
-# -----------------------------------------------------------------------------
-# RUTAS: UTILIDADES
-# -----------------------------------------------------------------------------
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect('/')
 
-
-@app.errorhandler(404)
-def not_found(e):
-    return render_page("""
-    <div class="card text-center" style="padding: 40px 20px;">
-        <div style="font-size: 48px; margin-bottom: 16px;">🔧</div>
-        <h2 style="margin-bottom: 8px;">Página no encontrada</h2>
-        <p style="color: var(--text-dim); margin-bottom: 20px;">Lo sentimos, esa ruta no existe o fue movida.</p>
-        <a href="/foro" class="btn btn-primary" style="width: auto; padding: 10px 24px;">Volver al inicio</a>
-    </div>
-    """, notif_count=get_notif_count(session['user_id']) if 'user_id' in session else 0), 404
-
-
-@app.errorhandler(500)
-def server_error(e):
-    return render_page("""
-    <div class="card text-center" style="padding: 40px 20px; border-color: var(--warning);">
-        <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
-        <h2 style="margin-bottom: 8px; color: var(--warning);">Algo salió mal</h2>
-        <p style="color: var(--text-dim); margin-bottom: 20px;">Nuestro equipo ya está trabajando en ello. Intenta recargar la página.</p>
-        <button onclick="location.reload()" class="btn btn-primary" style="width: auto; padding: 10px 24px;">Recargar</button>
-    </div>
-    """, notif_count=0), 500
-
-
 # -----------------------------------------------------------------------------
-# ENTRY POINT PARA RENDER
+# ENTRY POINT
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
     init_db()
