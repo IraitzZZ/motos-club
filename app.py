@@ -1,5 +1,5 @@
 # =============================================================================
-# MOTOSCLUB - RED SOCIAL PROFESIONAL (Versión 3.1 - Auto-Fix DB)
+# MOTOSCLUB - Versión 3.2 (Sintaxis SQL Corregida)
 # =============================================================================
 import os
 import re
@@ -21,7 +21,7 @@ csrf = CSRFProtect(app)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 # -----------------------------------------------------------------------------
-# BASE DE DATOS CON AUTO-CORRECCIÓN
+# BASE DE DATOS (SQL CORREGIDO)
 # -----------------------------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -30,62 +30,56 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # 1. Crear tablas si NO existen
+    # Tabla Usuarios
     cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (
         id SERIAL PRIMARY KEY, nombre TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
         email TEXT DEFAULT '', bio TEXT DEFAULT '', moto TEXT DEFAULT '',
-        avatar_url TEXT DEFAULT '', banner_url TEXT DEFAULT '',
         avatar_color TEXT DEFAULT '', racha INTEGER DEFAULT 0,
         ultima_actividad DATE, creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
     
+    # Tabla Posts
     cur.execute("""CREATE TABLE IF NOT EXISTS posts (
         id SERIAL PRIMARY KEY, usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         contenido TEXT NOT NULL, imagen_url TEXT DEFAULT '', categoria TEXT DEFAULT 'General',
         fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP, reportes INTEGER DEFAULT 0);""")
     
+    # Tabla Seguidores
     cur.execute("""CREATE TABLE IF NOT EXISTS seguidores (
         seguidor_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         seguido_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         PRIMARY KEY (seguidor_id, seguido_id));""")
     
+    # Tabla Likes
     cur.execute("""CREATE TABLE IF NOT EXISTS likes (
         usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
         PRIMARY KEY (usuario_id, post_id));""")
     
+    # Tabla Comentarios
     cur.execute("""CREATE TABLE IF NOT EXISTS comentarios (
         id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
         usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         contenido TEXT NOT NULL, fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
     
+    # Tabla Notificaciones
     cur.execute("""CREATE TABLE IF NOT EXISTS notificaciones (
         id SERIAL PRIMARY KEY, usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         tipo TEXT NOT NULL, mensaje TEXT NOT NULL, url TEXT,
         leido BOOLEAN DEFAULT FALSE, fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
     
+    # Tabla Bookmarks (CORREGIDO: Añadido paréntesis de cierre)
     cur.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
         usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
         post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE,
-        PRIMARY KEY (usuario_id, post_id);""")
+        PRIMARY KEY (usuario_id, post_id));""")
 
-    # 2. MIGRACIONES (Arreglar columnas faltantes si la tabla es vieja)
-    # Esto soluciona el error 500 al intentar leer columnas que no existen
-    columns_to_add = [
-        ("avatar_color", "TEXT DEFAULT ''"),
-        ("bio", "TEXT DEFAULT ''"),
-        ("moto", "TEXT DEFAULT ''"),
-        ("racha", "INTEGER DEFAULT 0"),
-        ("ultima_actividad", "DATE")
-    ]
-    
-    for col_name, col_type in columns_to_add:
+    # Migraciones: Añadir columnas si faltan (para no borrar datos)
+    cols = [("avatar_color", "TEXT DEFAULT ''"), ("bio", "TEXT DEFAULT ''"), ("moto", "TEXT DEFAULT ''"), ("racha", "INTEGER DEFAULT 0")]
+    for c, t in cols:
         try:
-            cur.execute(f"ALTER TABLE usuarios ADD COLUMN {col_name} {col_type}")
+            cur.execute(f"ALTER TABLE usuarios ADD COLUMN {c} {t}")
             conn.commit()
-        except psycopg2.errors.DuplicateColumn:
-            conn.rollback() # La columna ya existe, todo bien
-        except Exception as e:
-            conn.rollback() # Otro error, lo ignoramos por seguridad
+        except: conn.rollback()
 
     conn.commit()
     cur.close()
