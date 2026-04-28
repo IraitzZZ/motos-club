@@ -3,4 +3,3 @@ psycopg2-binary
 werkzeug
 flask-wtf
 gunicorn
-requests
