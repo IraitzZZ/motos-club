@@ -910,7 +910,7 @@ def login():
           <form method="POST" id="form-reg" style="display:none;">
             <input type="hidden" name="action" value="register">
             <label>Elige un nombre de usuario</label>
-            <input type="text" name="nombre" placeholder="solo letras, números y guiones" required autocomplete="username" pattern="[\w\-\.]+" minlength="3" maxlength="30">
+            <input type="text" name="nombre" placeholder="solo letras, números y guiones" required autocomplete="username" pattern="[a-zA-Z0-9_\-\.]+" minlength="3" maxlength="30">
             <label>Contraseña (mín. 6 caracteres)</label>
             <input type="password" name="password" placeholder="••••••••" required minlength="6" autocomplete="new-password">
             <button class="btn btn-primary" type="submit">CREAR CUENTA</button>
