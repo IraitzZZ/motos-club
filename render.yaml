@@ -1,9 +1,8 @@
 services:
   - type: web
     name: motosclub
-    env: python
+    runtime: python
     plan: free
-    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 120
     envVars:
@@ -13,8 +12,8 @@ services:
           property: connectionString
       - key: SECRET_KEY
         generateValue: true
-      - key: IMGBB_API_KEY
-        value: 27a447d71db292f6c1296f509a06b09e
+      - key: PYTHON_VERSION
+        value: 3.11.9
 
 databases:
   - name: motosclub-db
